@@ -8,6 +8,9 @@ import sys
 import os
 from pathlib import Path
 
+# Force CPU mode if CUDA is not available (must be before torch import)
+os.environ['CUDA_VISIBLE_DEVICES'] = '' if not os.path.exists('/dev/nvidia0') else os.environ.get('CUDA_VISIBLE_DEVICES', '0')
+
 # Add SAM 3D Body to path
 sam3d_path = Path(__file__).parent.parent.parent / "sam-3d-body"
 sys.path.insert(0, str(sam3d_path))
@@ -27,9 +30,18 @@ import json
 import traceback
 
 from sam_3d_body import load_sam_3d_body, SAM3DBodyEstimator
-from tools.vis_utils import visualize_sample_together
 from ergonomic_analyzer import ErgonomicAnalyzer
 from llm_analyzer import LLMErgonomicAnalyzer
+
+# Try to import visualization, but continue without it if OpenGL is not available
+try:
+    from tools.vis_utils import visualize_sample_together
+    VISUALIZATION_AVAILABLE = True
+except (ImportError, OSError) as e:
+    print(f"⚠️  Warning: Visualization not available (OpenGL/EGL issue): {e}")
+    print("ℹ️  Continuing without 3D visualization. Metrics and LLM insights will still work.")
+    VISUALIZATION_AVAILABLE = False
+    visualize_sample_together = None
 
 
 app = FastAPI(
@@ -74,17 +86,28 @@ async def startup_event():
             str(sam3d_path / "checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt")
         )
         
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {device}")
+        # Force CPU on macOS or when CUDA is not available
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            print(f"Using device: {device}")
+        else:
+            device = torch.device("cpu")
+            print(f"Using device: {device} (CUDA not available)")
+            # Ensure PyTorch uses CPU
+            torch.set_default_device('cpu')
         
         # Load SAM 3D Body model
         model, model_cfg = load_sam_3d_body(checkpoint_path, device=device, mhr_path=mhr_path)
+        model = model.to(device)  # Ensure model is on correct device
         
         # Create estimator
         model_state.sam3d_estimator = SAM3DBodyEstimator(
             sam_3d_body_model=model,
             model_cfg=model_cfg,
         )
+        
+        # Store device for later use
+        model_state.device = device
         
         # Initialize analyzers
         model_state.ergonomic_analyzer = ErgonomicAnalyzer()
@@ -206,13 +229,25 @@ async def analyze_image(
                 print(f"Warning: LLM analysis failed: {e}")
                 llm_insights = {"error": str(e)}
         
-        # Generate visualization
-        print("Creating visualization...")
-        vis_img = visualize_sample_together(img_bgr, outputs, model_state.sam3d_estimator.faces)
-        
-        # Convert visualization to base64
-        _, buffer = cv2.imencode('.jpg', vis_img)
-        vis_base64 = base64.b64encode(buffer).decode('utf-8')
+        # Generate visualization (if available)
+        vis_base64 = None
+        if VISUALIZATION_AVAILABLE:
+            print("Creating visualization...")
+            try:
+                vis_img = visualize_sample_together(img_bgr, outputs, model_state.sam3d_estimator.faces)
+                # Convert visualization to base64
+                _, buffer = cv2.imencode('.jpg', vis_img)
+                vis_base64 = base64.b64encode(buffer).decode('utf-8')
+            except Exception as e:
+                print(f"Warning: Visualization failed: {e}")
+                # Use original image as fallback
+                _, buffer = cv2.imencode('.jpg', img_bgr)
+                vis_base64 = base64.b64encode(buffer).decode('utf-8')
+        else:
+            # Use original image when visualization is not available
+            print("Visualization not available, using original image...")
+            _, buffer = cv2.imencode('.jpg', img_bgr)
+            vis_base64 = base64.b64encode(buffer).decode('utf-8')
         
         return AnalysisResponse(
             success=True,

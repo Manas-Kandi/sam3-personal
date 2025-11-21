@@ -157,7 +157,9 @@ class SAM3DBodyEstimator:
         batch = prepare_batch(img, self.transform, boxes, masks, masks_score)
 
         #################### Run model inference on an image ####################
-        batch = recursive_to(batch, "cuda")
+        # Use the device the model is on, not hardcoded "cuda"
+        device = next(self.model.parameters()).device
+        batch = recursive_to(batch, device)
         self.model._initialize_batch(batch)
 
         # Handle camera intrinsics
